@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import * as vscode from 'vscode';
 import { AetherMindConfig } from './config.js';
 
 export interface CompletionRequest {
@@ -100,7 +101,7 @@ export class AIService {
 							content: prompt
 						}
 					],
-					stream: false,
+					stream: true,
 					temperature: this.config.temperature
 				}),
 				signal: controller.signal
@@ -123,17 +124,68 @@ export class AIService {
 				throw new Error(errorMessage);
 			}
 
-			const data = await response.json();
-			
-			if (data.error) {
-				throw new Error(`API error: ${data.error.message}`);
+			// Read streaming response
+			const reader = response.body?.getReader();
+			if (!reader) {
+				throw new Error('No response body reader available');
 			}
 
-			const completion = data.content?.[0]?.text || '';
-			const finishReason = data.stop_reason || 'stop';
+			const decoder = new TextDecoder();
+			let accumulatedText = '';
+			let finishReason = 'stop';
+
+			while (true) {
+				// Check for cancellation
+				if (cancellationToken?.isCancellationRequested) {
+					reader.cancel();
+					throw new Error('Request cancelled');
+				}
+
+				const { done, value } = await reader.read();
+
+				if (done) {
+					break;
+				}
+
+				// Decode the chunk
+				const chunk = decoder.decode(value, { stream: true });
+				const lines = chunk.split('\n');
+
+				for (const line of lines) {
+					if (line.startsWith('data: ')) {
+						const data = line.slice(6).trim();
+						
+						if (data === '[DONE]') {
+							continue;
+						}
+
+						try {
+							const event = JSON.parse(data);
+							
+							// Handle content_block_delta events (streaming text)
+							if (event.type === 'content_block_delta' && event.delta?.text) {
+								accumulatedText += event.delta.text;
+							}
+							
+							// Handle message_stop event
+							if (event.type === 'message_stop') {
+								finishReason = event.stop_reason || 'stop';
+							}
+							
+							// Handle error events
+							if (event.type === 'error') {
+								throw new Error(`API error: ${event.error?.message || 'Unknown error'}`);
+							}
+						} catch (parseError) {
+							// Skip invalid JSON lines
+							continue;
+						}
+					}
+				}
+			}
 
 			return {
-				completion,
+				completion: accumulatedText,
 				finishReason
 			};
 
